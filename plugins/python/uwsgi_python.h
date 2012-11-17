@@ -186,6 +186,11 @@ struct uwsgi_python {
 	char *pyrun;
 	int start_response_nodelay;
 
+	void (*hook_write_string)(struct wsgi_request *, PyObject *);
+	ssize_t (*hook_wsgi_input_read)(struct wsgi_request *, char *, size_t, size_t *);
+	ssize_t (*hook_wsgi_input_readline)(struct wsgi_request *, char *, size_t);
+
+	char *programname;
 };
 
 
@@ -210,9 +215,7 @@ int manage_python_response(struct wsgi_request *);
 int uwsgi_python_call(struct wsgi_request *, PyObject *, PyObject *);
 PyObject *python_call(PyObject *, PyObject *, int, struct wsgi_request *);
 
-#ifdef UWSGI_SENDFILE
 PyObject *py_uwsgi_sendfile(PyObject *, PyObject *);
-#endif
 
 PyObject *py_uwsgi_write(PyObject *, PyObject *);
 PyObject *py_uwsgi_spit(PyObject *, PyObject *);
@@ -277,6 +280,9 @@ int uwsgi_python_manage_exceptions(void);
 int uwsgi_python_do_send_headers(struct wsgi_request *);
 void *uwsgi_python_tracebacker_thread(void *);
 PyObject *uwsgi_python_setup_thread(char *);
+
+ssize_t uwsgi_python_hook_simple_input_read(struct wsgi_request *, char *, size_t, size_t *);
+ssize_t uwsgi_python_hook_simple_input_readline(struct wsgi_request *, char *, size_t);
 
 #ifdef UWSGI_PYPY
 #undef UWSGI_MINTERPRETERS

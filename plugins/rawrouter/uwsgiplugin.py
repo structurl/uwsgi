@@ -4,4 +4,6 @@ CFLAGS = []
 LDFLAGS = []
 LIBS = []
 
-GCC_LIST = ['rawrouter', 'rr_events']
+REQUIRES = ['corerouter']
+
+GCC_LIST = ['rawrouter']

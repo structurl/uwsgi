@@ -4,4 +4,6 @@ CFLAGS = []
 LDFLAGS = []
 LIBS = []
 
-GCC_LIST = ['fastrouter', 'fr_events']
+REQUIRES = ['corerouter']
+
+GCC_LIST = ['fastrouter']
