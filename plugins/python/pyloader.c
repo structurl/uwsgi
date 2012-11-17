@@ -13,9 +13,7 @@ extern struct uwsgi_python up;
 
 extern char **environ;
 
-#ifdef UWSGI_SENDFILE
 PyMethodDef uwsgi_sendfile_method[] = {{"uwsgi_sendfile", py_uwsgi_sendfile, METH_VARARGS, ""}};
-#endif
 
 #ifdef UWSGI_ASYNC
 PyMethodDef uwsgi_eventfd_read_method[] = { {"uwsgi_eventfd_read", py_eventfd_read, METH_VARARGS, ""}};
@@ -77,7 +75,15 @@ int init_uwsgi_app(int loader, void *arg1, struct wsgi_request *wsgi_req, PyThre
 
 	PyObject *app_list = NULL, *applications = NULL;
 
+
+	if (uwsgi_apps_cnt >= uwsgi.max_apps) {
+		uwsgi_log("ERROR: you cannot load more than %d apps in a worker\n", uwsgi.max_apps);
+		return -1;
+	}
+
+
 	int id = uwsgi_apps_cnt;
+
 	int multiapp = 0;
 
 	int i;
@@ -323,10 +329,8 @@ int init_uwsgi_app(int loader, void *arg1, struct wsgi_request *wsgi_req, PyThre
 #endif
 
 	if (app_type == PYTHON_APP_TYPE_WSGI) {
-#ifdef UWSGI_SENDFILE
 		// prepare sendfile() for WSGI app
 		wi->sendfile = PyCFunction_New(uwsgi_sendfile_method, NULL);
-#endif
 
 #ifdef UWSGI_ASYNC
 		wi->eventfd_read = PyCFunction_New(uwsgi_eventfd_read_method, NULL);
@@ -351,8 +355,8 @@ int init_uwsgi_app(int loader, void *arg1, struct wsgi_request *wsgi_req, PyThre
 		// if we have multiple threads we need to initialize a PyThreadState for each one
 		for(i=0;i<uwsgi.threads;i++) {
 			//uwsgi_log("%p\n", uwsgi.core[i]->ts[id]);
-			uwsgi.core[i]->ts[id] = PyThreadState_New( ((PyThreadState *)wi->interpreter)->interp);
-			if (!uwsgi.core[i]->ts[id]) {
+			uwsgi.workers[uwsgi.mywid].cores[i].ts[id] = PyThreadState_New( ((PyThreadState *)wi->interpreter)->interp);
+			if (!uwsgi.workers[uwsgi.mywid].cores[i].ts[id]) {
 				uwsgi_log("unable to allocate new PyThreadState structure for app %s", wi->mountpoint);
 				goto doh;
 			}
@@ -475,7 +479,9 @@ PyObject *uwsgi_uwsgi_loader(void *arg1) {
 
 	PyObject *tmp_callable;
 	PyObject *applications;
+#ifdef UWSGI_EMBEDDED
 	PyObject *uwsgi_dict = get_uwsgi_pydict("uwsgi");
+#endif
 
 	char *module = (char *) arg1;
 
@@ -498,8 +504,10 @@ PyObject *uwsgi_uwsgi_loader(void *arg1) {
 		return NULL;
 	}
 
+#ifdef UWSGI_EMBEDDED
 	applications = PyDict_GetItemString(uwsgi_dict, "applications");
 	if (applications && PyDict_Check(applications)) return applications;
+#endif
 
 	applications = PyDict_GetItemString(wsgi_dict, "applications");
 	if (applications && PyDict_Check(applications)) return applications;

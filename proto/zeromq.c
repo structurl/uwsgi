@@ -2,6 +2,34 @@
 
 extern struct uwsgi_server uwsgi;
 
+void *uwsgi_zeromq_init() {
+	if (!uwsgi.zmq_context) {
+		uwsgi.zmq_context = zmq_init(1);
+                if (uwsgi.zmq_context == NULL) {
+                        uwsgi_error("zmq_init()");
+                        exit(1);
+                }
+	}
+	return uwsgi.zmq_context;
+}
+
+void uwsgi_zeromq_init_sockets() {
+
+	uwsgi_zeromq_init();	
+
+        struct uwsgi_socket *uwsgi_sock = uwsgi.sockets;
+        while(uwsgi_sock) {
+                        if (!uwsgi_sock->proto_name || strcmp(uwsgi_sock->proto_name, "zmq")) {
+                                goto zmq_next;
+                        }
+                        uwsgi_proto_zeromq_setup(uwsgi_sock);
+zmq_next:
+                        uwsgi_sock = uwsgi_sock->next;
+
+                }
+
+}
+
 #ifdef UWSGI_JSON
 #include <jansson.h>
 
@@ -569,18 +597,24 @@ void uwsgi_proto_zeromq_close(struct wsgi_request *wsgi_req) {
 ssize_t uwsgi_proto_zeromq_writev_header(struct wsgi_request *wsgi_req, struct iovec *iovec, size_t iov_len) {
 	int i;
 	ssize_t len;
-	ssize_t ret = 0;
+
+	struct uwsgi_buffer *ub = uwsgi_buffer_new(4096);
 
 	for (i = 0; i < (int) iov_len; i++) {
-		len = uwsgi_proto_zeromq_write(wsgi_req, iovec[i].iov_base, iovec[i].iov_len);
-		if (len <= 0) {
+		if (uwsgi_buffer_append(ub, iovec[i].iov_base, iovec[i].iov_len)) {
 			wsgi_req->write_errors++;
 			return 0;
 		}
-		ret += len;
 	}
 
-	return ret;
+	len = uwsgi_proto_zeromq_write(wsgi_req, ub->buf, ub->pos);
+	if (len <= 0) {
+		wsgi_req->write_errors++;
+		return 0;
+	}
+
+	uwsgi_buffer_destroy(ub);
+	return len;
 }
 
 ssize_t uwsgi_proto_zeromq_writev(struct wsgi_request * wsgi_req, struct iovec * iovec, size_t iov_len) {

@@ -1,10 +1,8 @@
-#ifdef UWSGI_SENDFILE
-
 #include "uwsgi.h"
 
 extern struct uwsgi_server uwsgi;
 
-ssize_t uwsgi_sendfile(struct wsgi_request *wsgi_req) {
+ssize_t uwsgi_sendfile(struct wsgi_request * wsgi_req) {
 
 	int fd = wsgi_req->sendfile_fd;
 	int sockfd = wsgi_req->poll.fd;
@@ -24,10 +22,11 @@ ssize_t uwsgi_sendfile(struct wsgi_request *wsgi_req) {
 
 	if (wsgi_req->sendfile_fd_size) {
 
-		if (!wsgi_req->sendfile_fd_chunk) wsgi_req->sendfile_fd_chunk = 4096;
+		if (!wsgi_req->sendfile_fd_chunk)
+			wsgi_req->sendfile_fd_chunk = 4096;
 
 		if (wsgi_req->socket->proto_sendfile) {
-			sst = wsgi_req->socket->proto_sendfile(wsgi_req);			
+			sst = wsgi_req->socket->proto_sendfile(wsgi_req);
 		}
 		else {
 			sst = uwsgi_do_sendfile(sockfd, wsgi_req->sendfile_fd, wsgi_req->sendfile_fd_size, wsgi_req->sendfile_fd_chunk, &wsgi_req->sendfile_fd_pos, uwsgi.async);
@@ -39,7 +38,7 @@ end:
 	return sst;
 }
 
-ssize_t uwsgi_do_sendfile(int sockfd, int filefd, size_t filesize, size_t chunk, off_t *pos, int async) {
+ssize_t uwsgi_do_sendfile(int sockfd, int filefd, size_t filesize, size_t chunk, off_t * pos, int async) {
 
 #if defined(__FreeBSD__) || defined(__DragonFly__)
 
@@ -100,8 +99,8 @@ ssize_t uwsgi_do_sendfile(int sockfd, int filefd, size_t filesize, size_t chunk,
 		return sf_ret;
 	}
 
-	while(written < filesize) {
-		sf_ret = sendfile(sockfd, filefd, pos, filesize-written);
+	while (written < filesize) {
+		sf_ret = sendfile(sockfd, filefd, pos, filesize - written);
 		if (sf_ret < 0) {
 			uwsgi_error("sendfile()");
 			return 0;
@@ -109,7 +108,7 @@ ssize_t uwsgi_do_sendfile(int sockfd, int filefd, size_t filesize, size_t chunk,
 		else if (sf_ret == 0) {
 			return 0;
 		}
-		written+= sf_ret;
+		written += sf_ret;
 	}
 	return written;
 
@@ -173,5 +172,3 @@ ssize_t uwsgi_do_sendfile(int sockfd, int filefd, size_t filesize, size_t chunk,
 #endif
 
 }
-
-#endif

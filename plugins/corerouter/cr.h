@@ -9,6 +9,12 @@
 #define cr_del_check_timeout(x) rb_erase(&x->rbt, timeouts);
 #define cr_del_timeout(u, x) rb_erase(&x->timeout->rbt, u->timeouts); free(x->timeout);
 
+#define cr_try_again if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {\
+                     	errno = EINPROGRESS;\
+                     	return -1;\
+                     }
+
+
 struct corerouter_session;
 
 struct uwsgi_corerouter {
@@ -19,7 +25,6 @@ struct uwsgi_corerouter {
 
 	void (*alloc_session)(struct uwsgi_corerouter *, struct uwsgi_gateway_socket *, struct corerouter_session *, struct sockaddr *, socklen_t);
 	int (*mapper)(struct uwsgi_corerouter *, struct corerouter_session *);
-	void (*switch_events)(struct uwsgi_corerouter *, struct corerouter_session *, int);
 
         int has_sockets;
 	int has_backends;
@@ -32,6 +37,8 @@ struct uwsgi_corerouter {
 
         int use_cache;
         int nevents;
+
+	int max_retries;
 
 	char *magic_table[256];
 
@@ -60,7 +67,6 @@ struct uwsgi_corerouter {
 	int use_cluster;
 
         struct uwsgi_subscribe_slot **subscriptions;
-        int subscription_regexp;
 
         struct uwsgi_string_list *fallback;
 
@@ -87,35 +93,31 @@ struct corerouter_session {
 
         int fd;
         int instance_fd;
-        int instance_stopped;
-        int status;
-        uint8_t h_pos;
-        uint16_t pos;
 
+	// corerouter related to this session
+	struct uwsgi_corerouter *corerouter;
+	// gateway socket related to this session
 	struct uwsgi_gateway_socket *ugs;
 
+	// parsed hostname
         char *hostname;
         uint16_t hostname_len;
 
         int has_key;
-        int retry;
+        int connecting;
 
         char *instance_address;
         uint64_t instance_address_len;
 
         struct uwsgi_subscribe_node *un;
         struct uwsgi_string_list *static_node;
-        int pass_fd;
         int soopt;
         int timed_out;
-
-	// used for tracking required event
-	int fd_state;
-	int instance_fd_state;
 
         struct uwsgi_rb_timer *timeout;
         int instance_failed;
 
+	// check content_length
         size_t post_cl;
         size_t post_remains;
 
@@ -124,33 +126,35 @@ struct corerouter_session {
         char *buf_file_name;
         FILE *buf_file;
 
-        uint8_t modifier1;
-        uint8_t modifier2;
-
         char *tmp_socket_name;
 
+	// store the client address
 	struct sockaddr_un addr;
         socklen_t addr_len;
 
-	int keepalive;
+	// async hooks:
+	// the session is watiting for this fd
+	ssize_t (*event_hook_read)(struct corerouter_session *);
+	ssize_t (*event_hook_write)(struct corerouter_session *);
+	ssize_t (*event_hook_instance_read)(struct corerouter_session *);
+	ssize_t (*event_hook_instance_write)(struct corerouter_session *);
 
-	char *write_queue;
-	size_t write_queue_len;
-	int write_queue_close;
+	void (*close)(struct corerouter_session *);
+	int (*retry)(struct uwsgi_corerouter *, struct corerouter_session *);
+	size_t retries;
 
-	char *instance_write_queue;
-	size_t instance_write_queue_len;
+	struct uwsgi_buffer *buffer;
+        size_t buffer_len;
+	off_t buffer_pos;
 
-	void (*close)(struct uwsgi_corerouter *, struct corerouter_session *);
-
-	ssize_t (*recv)(struct uwsgi_corerouter *, struct corerouter_session *, char *, size_t);
-        ssize_t (*send)(struct uwsgi_corerouter *, struct corerouter_session *, char *, size_t);
-
-	ssize_t (*instance_recv)(struct uwsgi_corerouter *, struct corerouter_session *, char *, size_t);
-        ssize_t (*instance_send)(struct uwsgi_corerouter *, struct corerouter_session *, char *, size_t);
+	struct uwsgi_header uh;
+	
+	uint8_t modifier1;
+	uint8_t modifier2;
 };
 
 void uwsgi_opt_corerouter(char *, char *, void *);
+void uwsgi_opt_undeferred_corerouter(char *, char *, void *);
 void uwsgi_opt_corerouter_use_socket(char *, char *, void *);
 void uwsgi_opt_corerouter_use_base(char *, char *, void *);
 void uwsgi_opt_corerouter_use_pattern(char *, char *, void *);
@@ -175,15 +179,15 @@ int uwsgi_cr_map_use_cache(struct uwsgi_corerouter *, struct corerouter_session 
 int uwsgi_cr_map_use_pattern(struct uwsgi_corerouter *, struct corerouter_session *);
 int uwsgi_cr_map_use_cluster(struct uwsgi_corerouter *, struct corerouter_session *);
 int uwsgi_cr_map_use_subscription(struct uwsgi_corerouter *, struct corerouter_session *);
+int uwsgi_cr_map_use_subscription_dotsplit(struct uwsgi_corerouter *, struct corerouter_session *);
 int uwsgi_cr_map_use_base(struct uwsgi_corerouter *, struct corerouter_session *);
 int uwsgi_cr_map_use_cs(struct uwsgi_corerouter *, struct corerouter_session *);
 int uwsgi_cr_map_use_to(struct uwsgi_corerouter *, struct corerouter_session *);
 int uwsgi_cr_map_use_static_nodes(struct uwsgi_corerouter *, struct corerouter_session *);
 
-int uwsgi_courerouter_has_has_backends(struct uwsgi_corerouter *);
+int uwsgi_corerouter_has_backends(struct uwsgi_corerouter *);
 
-ssize_t uwsgi_cr_simple_recv(struct uwsgi_corerouter *, struct corerouter_session *, char *, size_t);
-ssize_t uwsgi_cr_simple_send(struct uwsgi_corerouter *, struct corerouter_session *, char *, size_t);
-
-ssize_t uwsgi_cr_simple_instance_recv(struct uwsgi_corerouter *, struct corerouter_session *, char *, size_t);
-ssize_t uwsgi_cr_simple_instance_send(struct uwsgi_corerouter *, struct corerouter_session *, char *, size_t);
+int uwsgi_cr_hook_read(struct corerouter_session *, ssize_t (*)(struct corerouter_session *));
+int uwsgi_cr_hook_write(struct corerouter_session *, ssize_t (*)(struct corerouter_session *));
+int uwsgi_cr_hook_instance_read(struct corerouter_session *, ssize_t (*)(struct corerouter_session *));
+int uwsgi_cr_hook_instance_write(struct corerouter_session *, ssize_t (*)(struct corerouter_session *));

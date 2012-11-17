@@ -9,6 +9,12 @@ extern struct http_status_codes hsc[];
 
 extern PyTypeObject uwsgi_InputType;
 
+void python_simple_hook_write_string(struct wsgi_request *wsgi_req, PyObject *str) {
+	UWSGI_RELEASE_GIL
+        wsgi_req->response_size += wsgi_req->socket->proto_write(wsgi_req, PyString_AsString(str), PyString_Size(str));
+	UWSGI_GET_GIL
+}
+
 void uwsgi_opt_pythonpath(char *opt, char *value, void *foobar) {
 
 	int i;
@@ -71,6 +77,8 @@ struct uwsgi_option uwsgi_python_options[] = {
 	{"virtualenv", required_argument, 'H', "set PYTHONHOME/virtualenv", uwsgi_opt_set_str, &up.home, 0},
 	{"venv", required_argument, 'H', "set PYTHONHOME/virtualenv", uwsgi_opt_set_str, &up.home, 0},
 	{"pyhome", required_argument, 'H', "set PYTHONHOME/virtualenv", uwsgi_opt_set_str, &up.home, 0},
+	{"py-programname", required_argument, 0, "set python program name", uwsgi_opt_set_str, &up.programname, 0},
+	{"py-program-name", required_argument, 0, "set python program name", uwsgi_opt_set_str, &up.programname, 0},
 
 	{"pythonpath", required_argument, 0, "add directory (or glob) to pythonpath", uwsgi_opt_pythonpath, NULL,  0},
 	{"python-path", required_argument, 0, "add directory (or glob) to pythonpath", uwsgi_opt_pythonpath, NULL, 0},
@@ -169,6 +177,16 @@ int uwsgi_python_init() {
 
 	if (up.home != NULL) {
 #ifdef PYTHREE
+		// check for PEP 405 virtualenv (starting from python 3.3)
+		char *pep405_env = uwsgi_concat2(up.home, "/pyvenv.cfg");
+		if (uwsgi_file_exists(pep405_env)) {
+			uwsgi_log("PEP 405 virtualenv detected: %s\n", up.home);
+			free(pep405_env);
+			goto pep405;
+		}
+		free(pep405_env);
+
+		// build the PYTHONHOME wchar path
 		wchar_t *wpyhome;
 		size_t len = strlen(up.home) + 1; 
 		wpyhome = uwsgi_calloc(sizeof(wchar_t) * len );
@@ -180,19 +198,30 @@ int uwsgi_python_init() {
 		Py_SetPythonHome(wpyhome);
 		// do not free this memory !!!
 		//free(wpyhome);
+pep405:
 #else
 		Py_SetPythonHome(up.home);
 #endif
 		uwsgi_log("Set PythonHome to %s\n", up.home);
 	}
 
+	char *program_name = up.programname;
+	if (!program_name) {
+		program_name = uwsgi.binary_path;
+	}
 
 #ifdef PYTHREE
-	wchar_t pname[6];
-	mbstowcs(pname, "uWSGI", 6);
+	if (!up.programname) {
+		if (up.home) {
+			program_name = uwsgi_concat2(up.home, "/bin/python");
+		}
+	}
+
+	wchar_t *pname = uwsgi_calloc(sizeof(wchar_t) * (strlen(program_name)+1));
+	mbstowcs(pname, program_name, strlen(program_name)+1);
 	Py_SetProgramName(pname);
 #else
-	Py_SetProgramName("uWSGI");
+	Py_SetProgramName(program_name);
 #endif
 
 
@@ -203,11 +232,15 @@ int uwsgi_python_init() {
 	Py_Initialize();
 
 	if (!uwsgi.has_threads) {
-		uwsgi_log("*** Python threads support is disabled. You can enable it with --enable-threads ***\n");
+		uwsgi_log_initial("*** Python threads support is disabled. You can enable it with --enable-threads ***\n");
 	}
 
 	up.wsgi_spitout = PyCFunction_New(uwsgi_spit_method, NULL);
 	up.wsgi_writeout = PyCFunction_New(uwsgi_write_method, NULL);
+
+	up.hook_write_string = python_simple_hook_write_string;
+	up.hook_wsgi_input_read = uwsgi_python_hook_simple_input_read;
+	up.hook_wsgi_input_readline = uwsgi_python_hook_simple_input_readline;
 
 	up.main_thread = PyThreadState_Get();
 
@@ -279,9 +312,11 @@ realstuff:
 		return;
 	}
 
-	if (uwsgi.has_threads)
-		PyGILState_Ensure();
+	// always call it
+	PyGILState_Ensure();
+
 	// no need to worry about freeing memory
+#ifdef UWSGI_EMBEDDED
 	PyObject *uwsgi_dict = get_uwsgi_pydict("uwsgi");
 	if (uwsgi_dict) {
 		PyObject *ae = PyDict_GetItemString(uwsgi_dict, "atexit");
@@ -289,6 +324,7 @@ realstuff:
 			python_call(ae, PyTuple_New(0), 0, NULL);
 		}
 	}
+#endif
 
 	// this part is a 1:1 copy of mod_wsgi 3.x
         // it is required to fix some atexit bug with python 3
@@ -526,8 +562,8 @@ next:
 
 
 
+#ifdef UWSGI_EMBEDDED
 PyDoc_STRVAR(uwsgi_py_doc, "uWSGI api module.");
-
 
 #ifdef PYTHREE
 static PyModuleDef uwsgi_module3 = {
@@ -542,7 +578,6 @@ PyObject *init_uwsgi3(void) {
 }
 #endif
 
-#ifdef UWSGI_EMBEDDED
 void init_uwsgi_embedded_module() {
 	PyObject *new_uwsgi_module, *zero;
 	int i;
@@ -863,7 +898,7 @@ int uwsgi_python_magic(char *mountpoint, char *lazy) {
 
 }
 
-int uwsgi_python_mount_app(char *mountpoint, char *app, int regexp) {
+int uwsgi_python_mount_app(char *mountpoint, char *app) {
 
 	int id;
 
@@ -876,21 +911,6 @@ int uwsgi_python_mount_app(char *mountpoint, char *app, int regexp) {
 		else {
 			id = init_uwsgi_app(LOADER_MOUNT, app, uwsgi.wsgi_req, NULL, PYTHON_APP_TYPE_WSGI);
 		}
-
-#ifdef UWSGI_PCRE
-	int i;
-	if (regexp && id != -1) {
-		struct uwsgi_app *ua = &uwsgi_apps[id];
-		uwsgi_regexp_build(mountpoint, &ua->pattern, &ua->pattern_extra);
-		if (uwsgi.mywid == 0) {
-			for(i=1;i<=uwsgi.numproc;i++) {
-				uwsgi.workers[i].apps[id].pattern = ua->pattern;
-				uwsgi.workers[i].apps[id].pattern_extra = ua->pattern_extra;
-			}
-		}
-	}
-#endif
-
 		return id;
 	}
 	return -1;
@@ -1063,6 +1083,11 @@ void uwsgi_python_init_apps() {
 
 	struct http_status_codes *http_sc;
 
+	// lazy ?
+	if (uwsgi.mywid > 0) {
+		UWSGI_GET_GIL;
+	}
+
 #ifndef UWSGI_PYPY
 	// prepare for stack suspend/resume
 	if (uwsgi.async > 1) {
@@ -1173,6 +1198,7 @@ next:
 	}
 #endif
 
+#ifdef UWSGI_EMBEDDED
 	PyObject *uwsgi_dict = get_uwsgi_pydict("uwsgi");
         if (uwsgi_dict) {
                 up.after_req_hook = PyDict_GetItemString(uwsgi_dict, "after_req_hook");
@@ -1181,6 +1207,12 @@ next:
 			up.after_req_hook_args = PyTuple_New(0);
 			Py_INCREF(up.after_req_hook_args);
 		}
+	}
+#endif
+
+	// lazy ?
+	if (uwsgi.mywid > 0) {
+		UWSGI_RELEASE_GIL;
 	}
 
 }
@@ -1308,6 +1340,7 @@ int uwsgi_check_python_mtime(PyObject *times_dict, char *filename) {
 }
 
 PyObject *uwsgi_python_setup_thread(char *name) {
+
 	// block signals on this thread
         sigset_t smask;
         sigfillset(&smask);

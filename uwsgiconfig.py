@@ -1,6 +1,6 @@
 # uWSGI build system
 
-uwsgi_version = '1.3-dev'
+uwsgi_version = '1.5-dev'
 
 import os
 import re
@@ -12,6 +12,12 @@ uwsgi_cpu = os.uname()[4]
 
 import sys
 import subprocess
+from threading import Thread,Lock
+
+try:
+    from queue import Queue
+except:
+    from Queue import Queue
 
 from distutils import sysconfig
 
@@ -27,6 +33,16 @@ if not GCC:
 
 CPP = os.environ.get('CPP', 'cpp')
 
+CPUCOUNT = 1
+try:
+    import multiprocessing
+    CPUCOUNT = multiprocessing.cpu_count()
+except:
+    try:
+        CPUCOUNT = int(os.sysconf('SC_NPROCESSORS_ONLN'))
+    except:
+        pass
+
 binary_list = []
 
 # this is used for reporting (at the end of the build)
@@ -41,7 +57,9 @@ report['timer'] = False
 report['filemonitor'] = False
 report['udp'] = False
 report['pcre'] = False
+report['matheval'] = False
 report['routing'] = False
+report['alarm'] = False
 report['capabilities'] = False
 report['async'] = False
 report['minterpreters'] = False
@@ -53,13 +71,36 @@ report['ssl'] = False
 report['zeromq'] = False
 report['snmp'] = False
 report['threading'] = False
-report['sendfile'] = False
 report['xml'] = False
 report['sqlite3'] = False
 report['spooler'] = False
 report['debug'] = False
 report['plugin_dir'] = False
 report['ipv6'] = False
+
+compile_queue = None
+print_lock = None
+thread_compilers = []
+
+def thread_compiler(num):
+    while True:
+        (objfile, cmdline) = compile_queue.get()
+        if objfile:
+            print_lock.acquire()    
+            print("[thread %d][%s] %s" % (num, GCC, objfile))
+            print_lock.release()    
+            ret = os.system(cmdline)
+            if ret != 0:
+                os._exit(1)
+        elif cmdline:
+            print_lock.acquire()    
+            print(cmdline)
+            print_lock.release()    
+        else:
+            return
+
+
+  
 	
 def binarize(name):
     return name.replace('/', '_').replace('.','_').replace('-','_')
@@ -86,9 +127,9 @@ def uniq_warnings(elements):
 
     return new_elements
 
-if uwsgi_version.endswith('-dev') and os.path.exists('%s/.hg' % os.path.dirname(os.path.abspath( __file__ ))):
+if uwsgi_version.endswith('-dev') and os.path.exists('%s/.git' % os.path.dirname(os.path.abspath( __file__ ))):
     try:
-        uwsgi_version += spcall('hg tip --template "-{rev}"')
+        uwsgi_version += '-%s' % spcall('git rev-parse --short HEAD')
     except:
         pass
 
@@ -122,12 +163,31 @@ def add_o(x):
     x = x + '.o'
     return x
 
+def push_print(msg):
+    if not compile_queue:
+        print(msg)
+    else:
+        compile_queue.put((None, msg))
 
-def compile(cflags, objfile, srcfile):
+def push_command(objfile, cmdline):
+    if not compile_queue:
+        print("[%s] %s" % (GCC, objfile))
+        ret = os.system(cmdline)
+        if ret != 0:
+            sys.exit(1)
+    else:
+        compile_queue.put((objfile, cmdline))
+        
+
+def compile(cflags, last_cflags_ts, objfile, srcfile):
     source_stat = os.stat(srcfile)
     header_stat = os.stat('uwsgi.h')
     try:
         if os.environ.get('UWSGI_FORCE_REBUILD', None):
+            raise
+        if source_stat[8] >= last_cflags_ts:
+            raise
+        if header_stat[8] >= last_cflags_ts:
             raise
         object_stat = os.stat(objfile)
         if object_stat[8] <= source_stat[8]:
@@ -143,13 +203,21 @@ def compile(cflags, objfile, srcfile):
     except:
         pass
     cmdline = "%s -c %s -o %s %s" % (GCC, cflags, objfile, srcfile)
-    print("[%s] %s" % (GCC, objfile))
-    ret = os.system(cmdline)
-    if ret != 0:
-        sys.exit(1)
+    push_command(objfile, cmdline)
 
 
 def build_uwsgi(uc, print_only=False):
+
+    global print_lock, compile_queue, thread_compilers
+
+    if CPUCOUNT > 1:
+        print_lock = Lock()
+        compile_queue = Queue(maxsize=CPUCOUNT)
+        for i in range(0,CPUCOUNT):
+            t = Thread(target=thread_compiler,args=(i,))
+            t.daemon = True
+            t.start()
+            thread_compilers.append(t)
 
     gcc_list, cflags, ldflags, libs = uc.get_gcll()
 
@@ -176,6 +244,7 @@ def build_uwsgi(uc, print_only=False):
         print(' '.join(cflags))
         sys.exit(0)
 
+    print("detected CPU cores: %d" % CPUCOUNT)
     print("configured CFLAGS: %s" % ' '.join(cflags))
 
     try:
@@ -184,29 +253,40 @@ def build_uwsgi(uc, print_only=False):
         import binascii
         uwsgi_cflags = binascii.b2a_hex(' '.join(cflags).encode('ascii')).decode('ascii')
 
+    last_cflags_ts = 0
+    
     if os.path.exists('uwsgibuild.lastcflags'):
             ulc = open('uwsgibuild.lastcflags','r')
             last_cflags = ulc.read()
             ulc.close()
             if uwsgi_cflags != last_cflags:
                 os.environ['UWSGI_FORCE_REBUILD'] = '1'
+            else:
+                last_cflags_ts = os.stat('uwsgibuild.lastcflags')[8]
+            
+
+    ulc = open('uwsgibuild.lastcflags','w')
+    ulc.write(uwsgi_cflags)
+    ulc.close()
 
     cflags.append('-DUWSGI_CFLAGS=\\"%s\\"' % uwsgi_cflags)
     cflags.append('-DUWSGI_BUILD_DATE="\\"%s\\""' % time.strftime("%d %B %Y %H:%M:%S"))
 
-    print("*** uWSGI compiling server core ***")
+    post_build = []
+
+    push_print("*** uWSGI compiling server core ***")
     for file in gcc_list:
         objfile = file
         if objfile == 'uwsgi':
             objfile = 'main'
         if not objfile.endswith('.a'):
-            compile(' '.join(cflags), objfile + '.o', file + '.c')
+            compile(' '.join(cflags), last_cflags_ts, objfile + '.o', file + '.c')
 
     if uc.get('embedded_plugins'):
         ep = uc.get('embedded_plugins').split(',')
 
         if len(ep) > 0:
-            print("*** uWSGI compiling embedded plugins ***")
+            push_print("*** uWSGI compiling embedded plugins ***")
             for p in ep:
                 if p is None or p == 'None':
                     continue
@@ -222,9 +302,13 @@ def build_uwsgi(uc, print_only=False):
                     print("Error: plugin '%s' not found" % p)
                     sys.exit(1)
 
-                sys.path.insert(0, path)
-                import uwsgiplugin as up
-                reload(up)
+                try:
+                    import importlib
+                    up = importlib.machinery.SourceFileLoader('uwsgiplugin', '%s/uwsgiplugin.py' % path).load_module()
+                except:
+                    sys.path.insert(0, path)
+                    import uwsgiplugin as up
+                    reload(up)
 
                 p_cflags = cflags[:]
                 p_cflags += up.CFLAGS
@@ -249,9 +333,15 @@ def build_uwsgi(uc, print_only=False):
                 except:
                     pass
 
+                try:
+                    if up.post_build:
+                        post_build.append(up.post_build)
+                except:
+                    pass
+
                 for cfile in up.GCC_LIST:
                     if not cfile.endswith('.a'):
-                        compile(' '.join(uniq_warnings(p_cflags)),
+                        compile(' '.join(uniq_warnings(p_cflags)), last_cflags_ts,
                             path + '/' + cfile + '.o', path + '/' + cfile + '.c')
                         gcc_list.append('%s/%s' % (path, cfile))
                     else:
@@ -278,16 +368,17 @@ def build_uwsgi(uc, print_only=False):
                 up.LDFLAGS = None
                 up.LIBS = None
                 up.GCC_LIST = None
+                up.post_build = None
 
     if uc.get('plugins'):
 
         plugins = uc.get('plugins').split(',')
         if len(plugins) > 0:
-            print("*** uWSGI building plugins ***")
+            push_print("*** uWSGI building plugins ***")
 
             for p in plugins:
                 p = p.strip()
-                print("*** building plugin: %s ***" % p)
+                push_print("*** building plugin: %s ***" % p)
                 build_plugin("plugins/%s" % p, uc, cflags, ldflags, libs)
 
     bin_name = os.environ.get('UWSGI_BIN_NAME', uc.get('bin_name'))
@@ -297,9 +388,11 @@ def build_uwsgi(uc, print_only=False):
     for ef in binary_list:
         gcc_list.append("build/%s" % ef)
 
-    ulc = open('uwsgibuild.lastcflags','w')
-    ulc.write(uwsgi_cflags)
-    ulc.close()
+    if compile_queue:
+        for t in thread_compilers:
+            compile_queue.put((None, None))
+        for t in thread_compilers:
+            t.join()
 
     print("*** uWSGI linking ***")
     ldline = "%s -o %s %s %s %s" % (GCC, bin_name, ' '.join(uniq_warnings(ldflags)),
@@ -324,6 +417,9 @@ def build_uwsgi(uc, print_only=False):
     else:
         print("*** uWSGI is ready, launch it with %s ***" % bin_name)
 
+    for pb in post_build:
+        pb(uc)
+
 
 class uConf(object):
 
@@ -347,9 +443,10 @@ class uConf(object):
 
         self.config.read(filename)
         self.gcc_list = ['core/utils', 'core/protocol', 'core/socket', 'core/logging', 'core/master', 'core/master_utils', 'core/emperor',
-            'core/notify', 'core/mule', 'core/subscription', 'core/stats',
-            'core/setup_utils',
-            'core/plugins', 'core/lock', 'core/cache',
+            'core/notify', 'core/mule', 'core/subscription', 'core/stats', 'core/sendfile',
+            'core/offload',
+            'core/setup_utils', 'core/clock', 'core/init', 'core/buffer',
+            'core/plugins', 'core/lock', 'core/cache', 'core/daemons',
             'core/queue', 'core/event', 'core/signal', 'core/cluster',
             'core/rpc', 'core/gateway', 'core/loop', 'lib/rbtree', 'core/rb_timers', 'core/uwsgi']
         # add protocols
@@ -659,6 +756,7 @@ class uConf(object):
         if self.get('as_shared_library'):
             self.ldflags.append('-shared')
             self.ldflags.append('-fPIC')
+            self.cflags.append('-fPIC')
             self.cflags.append('-DUWSGI_AS_SHARED_LIBRARY')
             if uwsgi_os == 'Darwin':
                 self.ldflags.append('-dynamiclib')
@@ -712,7 +810,7 @@ class uConf(object):
             report['pcre'] = True
 
         if self.get('routing'):
-            if self.get('pcre') == 'auto':
+            if self.get('routing') == 'auto':
                 if has_pcre:
                     self.gcc_list.append('core/routing')
                     self.cflags.append("-DUWSGI_ROUTING") 
@@ -722,11 +820,27 @@ class uConf(object):
                 self.cflags.append("-DUWSGI_ROUTING")
                 report['routing'] = True
 
+        if self.get('alarm'):
+            if self.get('alarm') == 'auto':
+                if has_pcre:
+                    self.gcc_list.append('core/alarm')
+                    self.cflags.append("-DUWSGI_ALARM") 
+                    report['alarm'] = True
+            else:
+                self.gcc_list.append('core/alarm')
+                self.cflags.append("-DUWSGI_ALARM")
+                report['alarm'] = True
+
 
         if self.has_include('sys/capability.h') and uwsgi_os == 'Linux':
             self.cflags.append("-DUWSGI_CAP")
             self.libs.append('-lcap')
             report['capabilities'] = True
+
+        if self.has_include('matheval.h'):
+            self.cflags.append("-DUWSGI_MATHEVAL")
+            self.libs.append('-lmatheval')
+            report['matheval'] = True
 
         has_json = False
         has_uuid = False
@@ -920,11 +1034,6 @@ class uConf(object):
             self.cflags.append("-DUWSGI_THREADING")
             report['threading'] = True
 
-        if self.get('sendfile'):
-            self.cflags.append("-DUWSGI_SENDFILE")
-            self.gcc_list.append('core/sendfile')
-            report['sendfile'] = True
-
         if self.get('xml'):
             if self.get('xml') == 'auto':
                 xmlconf = spcall('xml2-config --libs')
@@ -1007,12 +1116,26 @@ def build_plugin(path, uc, cflags, ldflags, libs, name = None):
     import uwsgiplugin as up
     reload(up)
 
+    requires = []
+
     p_cflags = cflags[:]
     p_ldflags = ldflags[:]
 
     p_cflags += up.CFLAGS
     p_ldflags += up.LDFLAGS
     p_libs = up.LIBS
+
+    post_build = None
+
+    try:
+        requires = up.REQUIRES
+    except:
+        pass
+
+    try:
+        post_build = up.post_build
+    except:
+        pass
 
     p_cflags.insert(0, '-I.')
 
@@ -1042,7 +1165,7 @@ def build_plugin(path, uc, cflags, ldflags, libs, name = None):
     for cfile in up.GCC_LIST:
         if cfile.endswith('.a'): 
             gcc_list.append(cfile)
-        elif not cfile.endswith('.c') and not cfile.endswith('.cc'):
+        elif not cfile.endswith('.c') and not cfile.endswith('.cc') and not cfile.endswith('.m'):
             gcc_list.append(path + '/' + cfile + '.c')
         else:
             gcc_list.append(path + '/' + cfile)
@@ -1077,6 +1200,11 @@ def build_plugin(path, uc, cflags, ldflags, libs, name = None):
     except:
         pass
 
+    try:
+        p_cflags.remove('-pie')
+    except:
+        pass
+
 
     #for ofile in up.OBJ_LIST:
     #    gcc_list.insert(0,ofile)
@@ -1088,6 +1216,20 @@ def build_plugin(path, uc, cflags, ldflags, libs, name = None):
     if ret != 0:
         print("*** unable to build %s plugin ***" % name)
         sys.exit(1)
+
+    try:
+        if requires:
+            f = open('.uwsgi_plugin_section', 'w')
+            for rp in requires:
+                f.write("requires=%s\n" % rp)
+            f.close()
+            os.system("objcopy %s.so --add-section uwsgi=.uwsgi_plugin_section %s.so" % (plugin_dest, plugin_dest))
+            os.unlink('.uwsgi_plugin_section')
+    except:
+        pass
+
+    if post_build:
+        post_build(uc)
 
     print("*** %s plugin built and available in %s ***" % (name, plugin_dest + '.so'))
 
@@ -1154,6 +1296,8 @@ if __name__ == "__main__":
         os.system("rm -f lib/*.o")
         os.system("rm -f plugins/*/*.o")
         os.system("rm -f build/*.o")
+    elif cmd == '--check':
+        os.system("cppcheck --max-configs=1000 --enable=all -q core/ plugins/ proto/ lib/ apache2/")
 
     else:
         print("unknown uwsgiconfig command")
