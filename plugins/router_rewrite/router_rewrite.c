@@ -5,6 +5,8 @@ extern struct uwsgi_server uwsgi;
 
 int uwsgi_routing_func_rewrite(struct wsgi_request *wsgi_req, struct uwsgi_route *ur) {
 
+	char *tmp_qs = NULL;
+
 	char **subject = (char **) (((char *)(wsgi_req))+ur->subject);
         uint16_t *subject_len = (uint16_t *)  (((char *)(wsgi_req))+ur->subject_len);
 
@@ -18,27 +20,25 @@ int uwsgi_routing_func_rewrite(struct wsgi_request *wsgi_req, struct uwsgi_route
 		path_info_len = query_string - path_info;
 		query_string++;
 		query_string_len = strlen(query_string);
-	
+		if (wsgi_req->query_string_len > 0) {
+			tmp_qs = uwsgi_concat4n(query_string, query_string_len, "&", 1, wsgi_req->query_string, wsgi_req->query_string_len, "", 0);
+			query_string = tmp_qs;
+			query_string_len = strlen(query_string);
+		}	
 	}
+	// over engineering, could be requiredin the future...
 	else {
-		query_string = "";
+		if (wsgi_req->query_string_len > 0) {
+			query_string = wsgi_req->query_string;
+			query_string_len = wsgi_req->query_string_len;
+		}
+		else {
+			query_string = "";
+		}
 	}
 
 	char *ptr = uwsgi_req_append(wsgi_req, "PATH_INFO", 9, path_info, path_info_len);
         if (!ptr) goto clear;
-
-        // fill iovec
-        if (wsgi_req->var_cnt + 2 >= uwsgi.vec_size - (4 + 1)) {
-		uwsgi_log("not enough io vectors for rewriting url\n");
-		goto clear;
-	}
-
-        wsgi_req->hvec[wsgi_req->var_cnt].iov_base = ptr - (2 + 9);
-        wsgi_req->hvec[wsgi_req->var_cnt].iov_len = 9;
-        wsgi_req->var_cnt++;
-        wsgi_req->hvec[wsgi_req->var_cnt].iov_base = ptr;
-        wsgi_req->hvec[wsgi_req->var_cnt].iov_len = path_info_len;
-        wsgi_req->var_cnt++;
 
 	// set new path_info
 	wsgi_req->path_info = ptr;
@@ -47,31 +47,19 @@ int uwsgi_routing_func_rewrite(struct wsgi_request *wsgi_req, struct uwsgi_route
 	ptr = uwsgi_req_append(wsgi_req, "QUERY_STRING", 12, query_string, query_string_len);
 	if (!ptr) goto clear;
 
-        // fill iovec
-        if (wsgi_req->var_cnt + 2 >= uwsgi.vec_size - (4 + 1)) {
-		uwsgi_log("not enough io vectors for rewriting url\n");
-		goto clear;
-	}
-
-        wsgi_req->hvec[wsgi_req->var_cnt].iov_base = ptr - (2 + 12);
-        wsgi_req->hvec[wsgi_req->var_cnt].iov_len = 12;
-        wsgi_req->var_cnt++;
-        wsgi_req->hvec[wsgi_req->var_cnt].iov_base = ptr;
-        wsgi_req->hvec[wsgi_req->var_cnt].iov_len = query_string_len;
-        wsgi_req->var_cnt++;
-
-
 	// set new query_string
 	wsgi_req->query_string = ptr;
 	wsgi_req->query_string_len = query_string_len;
 
 	free(path_info);
+	if (tmp_qs) free(tmp_qs);
 	if (ur->custom)
 		return UWSGI_ROUTE_CONTINUE;
 	return UWSGI_ROUTE_NEXT;
 
 clear:
 	free(path_info);
+	if (tmp_qs) free(tmp_qs);
 	return UWSGI_ROUTE_BREAK;
 }
 

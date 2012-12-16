@@ -22,6 +22,7 @@ struct uwsgi_http {
 	int keepalive;
 
 #ifdef UWSGI_SSL
+	char *https_session_context;
 	int https_export_cert;
 #endif
 
@@ -68,7 +69,14 @@ void uwsgi_opt_https(char *opt, char *value, void *cr) {
         }
 
         // initialize ssl context
-        ugs->ctx = uwsgi_ssl_new_server_context(uwsgi_concat3(ucr->short_name, "-", ugs->name),crt, key, ciphers, client_ca);
+	char *name = uhttp.https_session_context;
+	if (!name) {
+		name = uwsgi_concat3(ucr->short_name, "-", ugs->name);
+	}
+        ugs->ctx = uwsgi_ssl_new_server_context(name, crt, key, ciphers, client_ca);
+	if (!ugs->ctx) {
+		exit(1);
+	}
         // set the ssl mode
         ugs->mode = UWSGI_HTTP_SSL;
 
@@ -102,6 +110,7 @@ struct uwsgi_option http_options[] = {
 #ifdef UWSGI_SSL
 	{"https", required_argument, 0, "add an https router/server on the specified address with specified certificate and key", uwsgi_opt_https, &uhttp, 0},
 	{"https-export-cert", no_argument, 0, "export uwsgi variable HTTPS_CC containing the raw client certificate", uwsgi_opt_true, &uhttp.https_export_cert, 0},
+	{"https-session-context", required_argument, 0, "set the session id context to the specified value", uwsgi_opt_set_str, &uhttp.https_session_context, 0},
 	{"http-to-https", required_argument, 0, "add an http router/server on the specified address and redirect all of the requests to https", uwsgi_opt_http_to_https, &uhttp, 0},
 #endif
 	{"http-processes", required_argument, 0, "set the number of http processes to spawn", uwsgi_opt_set_int, &uhttp.cr.processes, 0},
@@ -399,9 +408,9 @@ int http_parse(struct http_session *h_session, size_t http_req_len) {
 	while (ptr < watermark) {
 		if (*ptr == '\r') {
 			if (ptr + 1 >= watermark)
-				return 0;
+				break;
 			if (*(ptr + 1) != '\n')
-				return 0;
+				break;
 			// multiline header ?
 			if (ptr + 2 < watermark) {
 				if (*(ptr + 2) == ' ' || *(ptr + 2) == '\t') {
@@ -517,6 +526,14 @@ ssize_t hr_read_ssl_body(struct corerouter_session * cs) {
                 // fix waiting
                 if (cs->event_hook_write) {
                         uwsgi_cr_hook_write(cs, NULL);
+                }
+		int ret2 = SSL_pending(hs->ssl);
+                if (ret2 > 0) {
+			if (uwsgi_buffer_fix(hs->post_buf, hs->post_buf->len + ret2 )) return -1;
+                        if (SSL_read(hs->ssl, hs->post_buf->buf + ret, ret2) != ret2) {
+                                return -1;
+                        }
+                        ret += ret2;
                 }
 		hs->post_buf_len = ret;
         	hs->post_buf_pos = 0;

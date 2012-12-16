@@ -234,6 +234,7 @@ static int uwsgi_offload_sendfile_transfer(struct uwsgi_thread *ut, struct uwsgi
                 if (uor->written >= uor->len) {
 			return -1;
 		}
+		return 0;
 	}
         else if (len < 0) {
 		uwsgi_offload_retry
@@ -330,7 +331,7 @@ static int uwsgi_offload_net_transfer(struct uwsgi_thread *ut, struct uwsgi_offl
 				}
 			}
 			else if (fd == uor->s) {
-				rlen = read(uor->fd, uor->buf, 4096);
+				rlen = read(uor->s, uor->buf, 4096);
 				if (rlen > 0) {
 					uor->to_write = rlen;
 					uor->pos = 0;
