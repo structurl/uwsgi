@@ -784,7 +784,8 @@ int uwsgi_parse_vars(struct wsgi_request *wsgi_req) {
 							wsgi_req->method = ptrbuf;
 							wsgi_req->method_len = strsize;
 						}
-						else if (!uwsgi.log_x_forwarded_for && !uwsgi_strncmp("REMOTE_ADDR", 11, wsgi_req->hvec[wsgi_req->var_cnt].iov_base, wsgi_req->hvec[wsgi_req->var_cnt].iov_len)) {
+						else if ((!uwsgi.log_x_forwarded_for || uwsgi_strncmp("HTTP_X_FORWARDED_FOR", 20, wsgi_req->hvec[wsgi_req->var_cnt].iov_base, wsgi_req->hvec[wsgi_req->var_cnt].iov_len))
+							&& !uwsgi_strncmp("REMOTE_ADDR", 11, wsgi_req->hvec[wsgi_req->var_cnt].iov_base, wsgi_req->hvec[wsgi_req->var_cnt].iov_len)) {
 							wsgi_req->remote_addr = ptrbuf;
 							wsgi_req->remote_addr_len = strsize;
 						}
@@ -1375,7 +1376,7 @@ int uwsgi_hooked_parse_dict_dgram(int fd, char *buffer, size_t len, uint8_t modi
 
 
 #ifdef UWSGI_DEBUG
-	uwsgi_log("RLEN: %d\n", rlen);
+	uwsgi_log("RLEN: %ld\n", (long) rlen);
 #endif
 
 	// check for valid dict 4(header) 2(non-zero key)+1 2(value)
@@ -1414,7 +1415,7 @@ int uwsgi_hooked_parse_dict_dgram(int fd, char *buffer, size_t len, uint8_t modi
 
 
 #ifdef UWSGI_DEBUG
-	uwsgi_log("%p %p %d\n", ptrbuf, bufferend, bufferend - ptrbuf);
+	uwsgi_log("%p %p %ld\n", ptrbuf, bufferend, bufferend - ptrbuf);
 #endif
 
 	uwsgi_hooked_parse(ptrbuf, bufferend - ptrbuf, hook, data);
@@ -1664,18 +1665,31 @@ char *uwsgi_req_append(struct wsgi_request *wsgi_req, char *key, uint16_t keylen
 		return NULL;
 	}
 
+	if (wsgi_req->var_cnt >= uwsgi.vec_size - (4 + 2)) {
+        	uwsgi_log("max vec size reached. skip this header.\n");
+		return NULL;
+	}
+
 	char *ptr = wsgi_req->buffer + wsgi_req->uh.pktsize;
 
 	*ptr++ = (uint8_t) (keylen & 0xff);
 	*ptr++ = (uint8_t) ((keylen >> 8) & 0xff);
 
 	memcpy(ptr, key, keylen);
+	wsgi_req->hvec[wsgi_req->var_cnt].iov_base = ptr;
+        wsgi_req->hvec[wsgi_req->var_cnt].iov_len = keylen;
+	wsgi_req->var_cnt++;
 	ptr += keylen;
+
+	
 
 	*ptr++ = (uint8_t) (vallen & 0xff);
 	*ptr++ = (uint8_t) ((vallen >> 8) & 0xff);
 
 	memcpy(ptr, val, vallen);
+	wsgi_req->hvec[wsgi_req->var_cnt].iov_base = ptr;
+        wsgi_req->hvec[wsgi_req->var_cnt].iov_len = vallen;
+	wsgi_req->var_cnt++;
 
 	wsgi_req->uh.pktsize += (2 + keylen + 2 + vallen);
 
